@@ -1,7 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use core::time;
+use std::thread::{self, JoinHandle};
 use std::{
+    fs,
+    io::{BufRead, BufReader},
     ops::Add,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
 };
 use structopt;
 
@@ -90,25 +94,31 @@ struct QemuInstance {
     cmd: Vec<String>,
     nets: Vec<NetDevice>,
     base_path: String,
+    eve_serial: String,
 }
 
 impl QemuInstance {
-    fn new<T: Into<String>>(base_path: T) -> Self {
+    fn new<T: Into<String>>(base_path: T, serial: T) -> Self {
         Self {
             cmd: Vec::new(),
             nets: Vec::new(),
             base_path: base_path.into(),
+            eve_serial: serial.into(),
         }
     }
     fn machine(&mut self) -> &mut Self {
         self.cmd.push("-machine".to_string());
-        self.cmd
-            .push("q35,accel=kvm,usb=off,dump-guest-core=off,kernel-irqchip=split".to_string());
+        self.cmd.push(
+            "q35,accel=kvm,smm=on,usb=off,dump-guest-core=off,kernel-irqchip=split".to_string(),
+        );
         self
+        //,accel=kvm
     }
     fn cpu(&mut self) -> &mut Self {
         self.cmd.push("-cpu".to_string());
         self.cmd.push("host".to_string());
+        //self.cmd.push("SandyBridge".to_string());
+
         self
     }
     fn iommu(&mut self) -> &mut Self {
@@ -127,11 +137,11 @@ impl QemuInstance {
         self.cmd.push(t.into());
         self
     }
-    fn eve_serial<T: Into<String>>(&mut self, serial: T) -> &mut Self {
-        self.cmd.push("-smbios".to_string());
-        self.cmd.push(format!("type=1,serial={}", serial.into()));
-        self
-    }
+    // fn eve_serial<T: Into<String>>(&mut cmd: Command, serial: T) -> &mut Self {
+    //     self.cmd.push("-smbios".to_string());
+    //     self.cmd.push(format!("type=1,serial={}", serial.into()));
+    //     self
+    // }
     fn ram(&mut self, ram: u32) -> &mut Self {
         self.cmd.push("-m".to_string());
         self.cmd.push(ram.to_string());
@@ -151,6 +161,11 @@ impl QemuInstance {
             self.base_path,
             file.into()
         ));
+        // self.cmd.push(format!(
+        //     "if=pflash,format=raw,unit={},readonly=on,file=/usr/share/OVMF/{}",
+        //     segment,
+        //     file.into()
+        // ));
         self
     }
     fn drive<T: Into<String>>(&mut self, image: T) -> &mut Self {
@@ -174,8 +189,10 @@ impl QemuInstance {
         self.cmd.push("-device".to_string());
         self.cmd.push("tpm-tis,tpmdev=tpm0".to_string());
         self.cmd.push("-chardev".to_string());
-        self.cmd
-            .push("socket,id=chrtpm,path=/tmp/emulated_tpm-2/swtpm-sock".to_string());
+        self.cmd.push(format!(
+            "socket,id=chrtpm,path=./tpms/{}/swtpm-sock",
+            self.eve_serial
+        ));
         self
     }
 
@@ -197,55 +214,164 @@ impl QemuInstance {
         self
     }
 
-    fn spawn(&self) -> Result<()> {
+    fn gdb(&mut self) -> &mut Self {
+        self.cmd.push("-s".to_string());
+        self.cmd.push("-S".to_string());
+        self
+    }
+
+    fn spawn(&self, dry_run: bool) -> Result<()> {
         let mut cmd = Command::new("qemu-system-x86_64");
         cmd.args(self.cmd.clone());
         self.nets.iter().for_each(|e| {
             cmd.args(e.to_string());
         });
+
+        cmd.arg("-smbios");
+        cmd.arg(format!("type=1,serial={}", &self.eve_serial));
+
         let mut args_iter = cmd.get_args();
         while let Some(arg) = args_iter.next() {
             if (arg.to_string_lossy().starts_with('-')) {
                 print!("\t{}", arg.to_string_lossy());
                 if let Some(next_arg) = args_iter.next() {
-                    println!("{}", next_arg.to_string_lossy());
+                    println!(" {}", next_arg.to_string_lossy());
                 }
             }
         }
-        let mut child = cmd.spawn()?;
-        child.wait()?;
+        if !dry_run {
+            run_swtpm(&self.eve_serial)?;
+
+            let mut child = cmd.spawn().with_context(|| "Couldn't spawn QEMU")?;
+            child.wait()?;
+        }
         Ok(())
     }
 }
 
+fn run_process_bg(cmd: &mut Command) -> Result<JoinHandle<i32>> {
+    let mut child = cmd
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(anyhow::Error::from)
+        .with_context(|| {
+            format!(
+                "Cannot run {} {}",
+                cmd.get_program().to_string_lossy(),
+                cmd.get_args()
+                    .map(|e| e.to_string_lossy())
+                    .fold(String::new(), |mut acc, e| {
+                        acc.push_str(&e);
+                        acc
+                    })
+            )
+        })?;
+
+    let handle = thread::spawn(move || {
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let mut f = BufReader::new(stdout);
+        let mut fe = BufReader::new(stderr);
+
+        loop {
+            match child.try_wait() {
+                Ok(None) => {
+                    let mut buf = String::new();
+                    //println!("we are here");
+                    // match f.read_line(&mut buf) {
+                    //     Ok(0) => {
+                    //         println!("EOF -->> STDOUT");
+                    //         break;
+                    //     }
+                    //     Ok(_) => {
+                    //         print!("[TPM]: {}", buf);
+                    //     }
+                    //     Err(e) => println!("an error!: {:?}", e),
+                    // }
+                    match fe.read_line(&mut buf) {
+                        Ok(0) => {
+                            println!("EOF -->> STDERR");
+                            break;
+                        }
+                        Ok(_) => {
+                            //print!("[TPM]: {}", buf);
+                        }
+                        Err(e) => println!("an error!: {:?}", e),
+                    }
+                }
+                Ok(Some(exit_status)) => {
+                    println!("Process exited with {}", exit_status);
+                    break;
+                }
+                Err(err) => {
+                    println!("Process exited with error {}", err);
+                    break;
+                }
+            }
+        }
+        0
+    });
+    Ok(handle)
+}
+
+fn run_swtpm<T: Into<String>>(serial_number: T) -> Result<JoinHandle<i32>> {
+    let mut cmd = Command::new("swtpm");
+    let tpm_state_path = format!("./tpms/{}", serial_number.into());
+    fs::create_dir_all(&tpm_state_path)?;
+    let args = format!(
+        "socket --tpmstate dir={} --ctrl type=unixio,path={}/swtpm-sock --log level=20 --tpm2 -t",
+        &tpm_state_path, &tpm_state_path
+    );
+    cmd.args(args.split_ascii_whitespace());
+
+    println!("starting swtpm: {}", args);
+    run_process_bg(&mut cmd)
+}
+
+fn run_dmesg() {
+    let mut cmd = Command::new("dmesg");
+    run_process_bg(&mut cmd).unwrap().join();
+}
+
 fn main() -> Result<()> {
-    QemuInstance::new("/home/rucoder/zd/eve/dist/amd64/current")
-        .machine()
-        .eve_serial("13471118009978")
-        .cpu()
-        .iommu()
-        .ram(4096)
-        .rtc()
-        .serial()
-        //.video("sdl")
-        .bios_file("OVMF_CODE.fd", 0)
-        .bios_file("OVMF_VARS.fd", 1)
-        .drive("live.qcow2")
-        .net(
-            NetDevice::new("eth0")
-                .port_forward(2222, 22)
-                .mask("192.168.1.0/24")
-                .dhcp_start("192.168.1.10"),
-        )
-        .net(
-            NetDevice::new("eth1")
-                .mask("192.168.2.0/24")
-                .dhcp_start("192.168.2.10"),
-        )
-        //.tpm()
-        .vga()
-        .virtio_gpu()
-        //.append("console=ttyS1")
-        .spawn()?;
+    //run_dmesg();
+    //let tpm = run_swtpm("134711180099780011")?;
+    //thread::sleep(time::Duration::from_secs(2));
+
+    QemuInstance::new(
+        "/home/parallels/tpm/eve-mikem/dist/amd64/current",
+        "Mike-0002",
+    )
+    .machine()
+    .cpu()
+    .iommu()
+    .ram(512)
+    .rtc()
+    .serial()
+    //.video("sdl")
+    .bios_file("OVMF_CODE.fd", 0)
+    .bios_file("OVMF_VARS.fd", 1)
+    .drive("live.qcow2")
+    .net(
+        NetDevice::new("eth0")
+            .port_forward(2222, 22)
+            .mask("192.168.1.0/24")
+            .dhcp_start("192.168.1.10"),
+    )
+    .net(
+        NetDevice::new("eth1")
+            .mask("192.168.2.0/24")
+            .dhcp_start("192.168.2.10"),
+    )
+    .tpm()
+    .vga()
+    //.gdb()
+    //.virtio_gpu()
+    //.append("console=ttyS1")
+    .spawn(false)?;
+
+    println!("Exiting vm-runner...");
+    //tpm.join().unwrap();
     Ok(())
 }
