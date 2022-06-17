@@ -220,6 +220,15 @@ impl QemuInstance {
         self
     }
 
+    fn uefi_debug_log(&mut self) -> &mut Self {
+        //-debugcon file:debug.log -global isa-debugcon.iobase=0x402
+        self.cmd.push("-debugcon".to_string());
+        self.cmd.push("file:debug.log".to_string());
+        self.cmd.push("-global".to_string());
+        self.cmd.push("isa-debugcon.iobase=0x402".to_string());
+        self
+    }
+
     fn spawn(&self, dry_run: bool) -> Result<()> {
         let mut cmd = Command::new("qemu-system-x86_64");
         cmd.args(self.cmd.clone());
@@ -366,7 +375,8 @@ fn main() -> Result<()> {
     )
     .tpm()
     .vga()
-    //.gdb()
+    .uefi_debug_log()
+    .gdb()
     //.virtio_gpu()
     //.append("console=ttyS1")
     .spawn(false)?;
