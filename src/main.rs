@@ -196,9 +196,14 @@ impl QemuInstance {
         self
     }
 
-    fn vga(&mut self) -> &mut Self {
-        self.cmd.push("-vga".to_string());
-        self.cmd.push("std".to_string());
+    fn vga(&mut self, gui: bool) -> &mut Self {
+        if gui {
+            self.cmd.push("-vga".to_string());
+            self.cmd.push("std".to_string());
+        }
+        else {
+            self.cmd.push("-nographic".to_string());
+        }
         self
     }
 
@@ -348,38 +353,35 @@ fn main() -> Result<()> {
     //let tpm = run_swtpm("134711180099780011")?;
     //thread::sleep(time::Duration::from_secs(2));
 
-    QemuInstance::new(
-        "/home/parallels/tpm/eve-mikem/dist/amd64/current",
-        "Mike-0002",
-    )
-    .machine()
-    .cpu()
-    .iommu()
-    .ram(512)
-    .rtc()
-    .serial()
-    //.video("sdl")
-    .bios_file("OVMF_CODE.fd", 0)
-    .bios_file("OVMF_VARS.fd", 1)
-    .drive("live.qcow2")
-    .net(
-        NetDevice::new("eth0")
-            .port_forward(2222, 22)
-            .mask("192.168.1.0/24")
-            .dhcp_start("192.168.1.10"),
-    )
-    .net(
-        NetDevice::new("eth1")
-            .mask("192.168.2.0/24")
-            .dhcp_start("192.168.2.10"),
-    )
-    .tpm()
-    .vga()
-    .uefi_debug_log()
-    .gdb()
-    //.virtio_gpu()
-    //.append("console=ttyS1")
-    .spawn(false)?;
+    QemuInstance::new("/home/rucoder/zd/grub/eve/dist/amd64/current", "Mike-0003")
+        .machine()
+        .cpu()
+        .iommu()
+        .ram(512)
+        .rtc()
+        .serial()
+        //.video("sdl")
+        .bios_file("OVMF_CODE.fd", 0)
+        .bios_file("OVMF_VARS.fd", 1)
+        .drive("live.qcow2")
+        .net(
+            NetDevice::new("eth0")
+                .port_forward(2222, 22)
+                .mask("192.168.1.0/24")
+                .dhcp_start("192.168.1.10"),
+        )
+        .net(
+            NetDevice::new("eth1")
+                .mask("192.168.2.0/24")
+                .dhcp_start("192.168.2.10"),
+        )
+        .tpm()
+        .vga(false)
+        .uefi_debug_log()
+        //.gdb()
+        //.virtio_gpu()
+        //.append("console=ttyS1")
+        .spawn(false)?;
 
     println!("Exiting vm-runner...");
     //tpm.join().unwrap();
