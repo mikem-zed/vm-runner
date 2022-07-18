@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use core::time;
+use serde::{Deserialize, Serialize};
+use std::env;
 use std::thread::{self, JoinHandle};
 use std::{
     fs,
@@ -7,7 +10,7 @@ use std::{
     ops::Add,
     process::{Child, Command, Stdio},
 };
-use structopt;
+//use structopt;
 
 // QEMU_OPTS_NET1="192.168.1.0/24"
 // QEMU_OPTS_NET1_FIRST_IP="192.168.1.10"
@@ -30,6 +33,61 @@ use structopt;
 // -rtc base=utc,clock=rt \
 // -netdev user,id=eth0,net=$QEMU_OPTS_NET1,dhcpstart=$QEMU_OPTS_NET1_FIRST_IP,hostfwd=tcp::$SSH_PORT-:22$QEMU_TFTP_OPTS -device virtio-net-pci,netdev=eth0,romfile="" \
 // -netdev user,id=eth1,net=$QEMU_OPTS_NET2,dhcpstart=$QEMU_OPTS_NET2_FIRST_IP -device virtio-net-pci,netdev=eth1,romfile=""
+
+/// All VMs are storred in ./vms folder
+/// Each
+
+#[derive(Serialize, Deserialize)]
+struct RunnerConfig {
+    vm_path: String,
+    default_build: Option<String>,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    config_path: String,
+}
+
+impl RunnerConfig {
+    fn load_or_create() -> Result<Self> {
+        let home_path = if let Some(home_dir) = home::home_dir() {
+            home_dir
+        } else {
+            env::current_dir()?
+        };
+        let runner_dir = home_path.join(".vm-runner");
+        let default_vm_dir = &runner_dir.join("vms");
+        let runner_config_path = &runner_dir.join("config");
+        if !runner_dir.exists() {
+            fs::create_dir_all(runner_dir)?;
+        }
+        if !default_vm_dir.exists() {
+            fs::create_dir(default_vm_dir)?;
+        }
+        if !runner_config_path.exists() {
+            let cfg = Self {
+                vm_path: default_vm_dir.as_os_str().to_string_lossy().to_string(),
+                default_build: None,
+                config_path: runner_config_path.as_os_str().to_string_lossy().to_string(),
+            };
+            let json = serde_json::to_string_pretty(&cfg)?;
+            fs::write(runner_config_path, json)?;
+            Ok(cfg)
+        } else {
+            let json = fs::read_to_string(runner_config_path)?;
+            let mut cfg: RunnerConfig = serde_json::from_str(&json)?;
+            cfg.config_path = runner_config_path.as_os_str().to_string_lossy().to_string();
+            Ok(cfg)
+        }
+    }
+    fn incomplete(&self) -> bool {
+        self.default_build.is_none()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct vm {
+    name: String,
+    build_override: String,
+}
 
 #[derive(Debug)]
 struct NetDevice {
@@ -168,12 +226,14 @@ impl QemuInstance {
         // ));
         self
     }
-    fn drive<T: Into<String>>(&mut self, image: T) -> &mut Self {
+    fn drive<T: Into<String>>(&mut self, image: T, format: T) -> &mut Self {
         self.cmd.push("-drive".to_string());
+        //,id=uefi-disk
         self.cmd.push(format!(
-            "file={}/{},format=qcow2,id=uefi-disk",
+            "file={}/{},format={}",
             self.base_path,
-            image.into()
+            image.into(),
+            format.into()
         ));
         self
     }
@@ -200,8 +260,7 @@ impl QemuInstance {
         if gui {
             self.cmd.push("-vga".to_string());
             self.cmd.push("std".to_string());
-        }
-        else {
+        } else {
             self.cmd.push("-nographic".to_string());
         }
         self
@@ -249,7 +308,7 @@ impl QemuInstance {
             if (arg.to_string_lossy().starts_with('-')) {
                 print!("\t{}", arg.to_string_lossy());
                 if let Some(next_arg) = args_iter.next() {
-                    println!(" {}", next_arg.to_string_lossy());
+                    println!(" {} \\", next_arg.to_string_lossy());
                 }
             }
         }
@@ -348,22 +407,40 @@ fn run_dmesg() {
     run_process_bg(&mut cmd).unwrap().join();
 }
 
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct RunnerOptions {}
+
 fn main() -> Result<()> {
     //run_dmesg();
     //let tpm = run_swtpm("134711180099780011")?;
     //thread::sleep(time::Duration::from_secs(2));
 
-    QemuInstance::new("/home/rucoder/zd/grub/eve/dist/amd64/current", "Mike-0003")
+    let cfg = RunnerConfig::load_or_create()?;
+
+    let cli = RunnerOptions::parse();
+
+    // if cfg.incomplete() {
+    //     println!(
+    //         "Default EVE build directory is not set in {}",
+    //         cfg.config_path
+    //     );
+    //     return Ok(());
+    // }
+
+    QemuInstance::new("/home/rucoder/zd/grub/eve/dist/amd64/current", "Mike-0004")
         .machine()
         .cpu()
         .iommu()
-        .ram(512)
+        .ram(1024)
         .rtc()
         .serial()
         //.video("sdl")
         .bios_file("OVMF_CODE.fd", 0)
         .bios_file("OVMF_VARS.fd", 1)
-        .drive("live.qcow2")
+        //.drive("live.qcow2")
+        //.drive("installer.raw", "raw")
+        .drive("installed.qcow2", "qcow2")
         .net(
             NetDevice::new("eth0")
                 .port_forward(2222, 22)
